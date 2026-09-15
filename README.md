@@ -112,11 +112,108 @@ Linux: radxa_svc_glink.ko 只提供窗口，不参与控制
    服务挂掉的表现是 hwmon 消失、`dmesg` 出现 `radxa_svc_glink ... ETIMEDOUT`，
    **重启即可恢复**。本工具已经为此做了省请求的设计（`status` 只发 4 个请求）。
 
+## 编译成二进制（可选）
+
+`q8b-fan` 本体是**纯 bash 脚本，不需要编译**，`curl` 下来就能用。
+仓库里另外提供了一份**等价的 C 实现**（[`src/q8b-fan.c`](src/q8b-fan.c)，同样的命令、同样的输出），
+编译出来是一个**单文件、静态链接、零依赖**的可执行文件 —— 适合拷到别的板子上直接跑。
+
+两种实现行为一致，选一个用就行：
+
+| 形式 | 产物 | 运行时依赖 | 体积 |
+|---|---|---|---|
+| bash 脚本（默认） | `q8b-fan` | `bash` + `awk` | 13 KB |
+| C 二进制（动态） | `build/q8b-fan` | glibc | ~20 KB |
+| **C 二进制（静态）** | `build/q8b-fan` | **无** | ~780 KB |
+| shc 包装 | `build/q8b-fan-shc` | `bash` | ~15 KB |
+
+### 方式 1：直接下载预编译二进制（最省事）
+
+推 `v*` tag 时 CI 会自动编译 aarch64 / x86_64 静态二进制并附到 Release：
+
+```bash
+curl -fL -o q8b-fan \
+  https://github.com/ctr54188/radxa-dragon-q8b-fan/releases/latest/download/q8b-fan-aarch64
+sudo install -m 0755 q8b-fan /usr/local/sbin/q8b-fan
+sudo q8b-fan status
+```
+
+每次 push / PR 也都会构建，可以在仓库 **Actions** 页面的 artifact 里下载。
+
+### 方式 2：在 Q8B 本机编译
+
+```bash
+sudo apt update && sudo apt install -y gcc make
+
+git clone https://github.com/ctr54188/radxa-dragon-q8b-fan.git
+cd radxa-dragon-q8b-fan
+
+make                  # -> build/q8b-fan（动态链接）
+make STATIC=1         # -> build/q8b-fan（静态，可拷到任何 aarch64 Linux）
+file build/q8b-fan
+
+sudo make install     # -> /usr/local/sbin/q8b-fan
+sudo make uninstall   # 卸载
+make clean
+```
+
+`make` 只调用 `$(CC)` 编译一个 `.c` 文件，没有别的依赖。
+
+### 方式 3：交叉编译（在 x86_64 Linux 上编出 aarch64）
+
+```bash
+sudo apt install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+make CROSS_COMPILE=aarch64-linux-gnu- STATIC=1
+file build/q8b-fan
+# build/q8b-fan: ELF 64-bit LSB executable, ARM aarch64, statically linked
+```
+
+> 如果报 `fatal error: bits/wordsize.h: No such file or directory`，说明该发行版的
+> 交叉工具链 sysroot 不全（Debian/Ubuntu 上补装 `libc6-dev-arm64-cross` 即可），
+> 否则用方式 4。
+
+### 方式 4：用 Docker（任意平台，含 macOS）
+
+```bash
+# 在 arm64 机器（Apple Silicon）上出 aarch64 静态二进制，原生速度
+docker run --rm -v "$PWD":/w -w /w --platform linux/arm64 gcc:13 make STATIC=1
+
+# 在 x86_64 机器上出 aarch64
+docker run --rm -v "$PWD":/w -w /w gcc:13 \
+  sh -c 'apt-get update -qq && apt-get install -y -qq gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+         && make CROSS_COMPILE=aarch64-linux-gnu- STATIC=1'
+```
+
+### 方式 5：把 bash 脚本“编译”成 ELF（shc）
+
+```bash
+sudo apt install -y shc        # macOS: brew install shc
+make shc                       # -> build/q8b-fan-shc
+file build/q8b-fan-shc         # ELF，但运行时仍然需要 /bin/bash
+```
+
+`shc` 只是把脚本加密后嵌进一个 ELF 壳，**不是真正的独立二进制**；
+要真正零依赖请用方式 2/3/4。
+
+### CI（`.github/workflows/build.yml`）
+
+- 在 GitHub 原生的 **`ubuntu-24.04-arm`** 和 `ubuntu-latest` runner 上**本机编译**
+  （不用交叉工具链，规避 sysroot 问题）；
+- `push` / `PR` / 手动触发 → 上传 `q8b-fan-aarch64`、`q8b-fan-x86_64` 两个 artifact；
+- 推 `v*` tag → 自动发 Release 并附带这两个二进制。
+
+```bash
+git tag v1.1.0 && git push origin v1.1.0     # 一键出二进制 + Release
+```
+
 ## 目录结构
 
 ```
-q8b-fan                  # 控制工具（纯 bash，无依赖）
+q8b-fan                  # 控制工具（纯 bash，免编译）
+Makefile                 # 编译 C 实现 / shc 包装
+.github/workflows/       # CI：构建 aarch64 + x86_64 静态二进制并发布 Release
 NOTES.md                 # 完整技术笔记：原理 / 协议 / 接口 / 实测 / 踩坑
+src/q8b-fan.c            # 等价的 C 实现（make 编译成单文件二进制）
 src/radxa_svc_glink.c    # 上游参考源码（见 src/README.md）
 src/leds-qcom-lpg.c
 src/sc8280xp-pmics.dtsi

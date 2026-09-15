@@ -43,6 +43,10 @@ static const char *prog = "q8b-fan";
 
 static void col_init(void)
 {
+	/* line buffering even when stdout is a pipe, so that "watch" does not
+	 * lose its output when the process is killed (e.g. by timeout) */
+	setvbuf(stdout, NULL, _IOLBF, 0);
+
 	if (isatty(STDOUT_FILENO)) {
 		C_RED = "\033[31m"; C_GRN = "\033[32m"; C_YEL = "\033[33m";
 		C_BLD = "\033[1m";  C_OFF = "\033[0m";
@@ -99,10 +103,12 @@ static char *xread(const char *path)
 		len += n;
 		if (len + 1 >= cap) {
 			char *nb = realloc(buf, cap *= 2);
+
 			if (!nb) { free(buf); fclose(f); return NULL; }
 			buf = nb;
 		}
 	}
+	if (ferror(f)) { free(buf); fclose(f); return NULL; }
 	fclose(f);
 	buf[len] = '\0';
 	while (len && isspace((unsigned char)buf[len - 1]))
