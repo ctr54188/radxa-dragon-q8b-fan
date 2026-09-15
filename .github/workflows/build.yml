@@ -12,31 +12,29 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # native runners: no cross toolchain / sysroot games needed.
+    # ubuntu-24.04-arm is free for public repositories.
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: aarch64
-            cross: aarch64-linux-gnu-
+            runner: ubuntu-24.04-arm
           - arch: x86_64
-            cross: ""
+            runner: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: install cross toolchain
-        if: matrix.cross != ''
+      - name: toolchain
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcc-${{ matrix.arch }}-linux-gnu
-
-      - name: show configuration
-        run: make info CROSS_COMPILE='${{ matrix.cross }}' STATIC=1
+          cc --version | head -1
+          make --version | head -1
 
       - name: build static binary
-        run: make CROSS_COMPILE='${{ matrix.cross }}' STATIC=1
+        run: make STATIC=1
 
-      - name: rename + report
+      - name: report
         run: |
           mv build/q8b-fan build/q8b-fan-${{ matrix.arch }}
           ls -l build/
