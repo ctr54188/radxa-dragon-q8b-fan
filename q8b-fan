@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# =====================================================================
+#  q8b-fan - fan control for the Radxa Dragon Q8B
+#
+#  How the fan actually works on this board:
+#
+#    BIOS: Radxa Platform Configuration -> Hypervisor Settings
+#          must be "Auto" (or Disabled/Close) -- NOT "Enable"
+#      -> UEFI boots the ADSP (soc@0/remoteproc@3000000) with Radxa's
+#         SVC firmware
+#           -> firmware service "RADXA_SVC_ADSP_APPS" over GLINK/rpmsg:
+#                - reads its own tsens sensors
+#                - runs the fan control loop
+#                - drives the PMIC (PMC8280C) LPG hardware PWM, channel 3,
+#                  25 kHz -> PMIC GPIO_08 (= EDP_BL_PWM) -> R410 -> Q20
+#                  -> J6 pin3 -> fan
+#
+#  Linux only gets a window into that service through radxa_svc_glink
+#  (drivers/platform/arm64/radxa_svc_glink.c):
+#
+#    /sys/class/hwmon/hwmonN/pwm1          duty 0..255  (writable in manual mode)
+#    /sys/class/hwmon/hwmonN/pwm1_enable   0 = full, 1 = manual, 2 = auto
+#    /sys/class/platform-profile/...       quiet | performance
+#    /sys/kernel/debug/radxa_svc_glink/*   firmware state / info / log
+#
+#  Every sysfs/debugfs read above is a round trip (rpmsg) to the ADSP,
+#  serialized with a 5 s timeout, so this tool keeps the number of
+#  requests per invocation small on purpose.
+#
+#  If the service dies (hwmon device disappears, dmesg shows
+#  "radxa_svc_glink ... ETIMEDOUT"), just reboot - the ADSP restarts and
+#  the service comes back.
+#
+#  NOTE: hwmonN is not stable across reboots - always look it up by name.
+#  NOTE: never enable the pmc8280c-pwm node in the device tree: the
+#        leds-qcom-lpg driver would grab the very same PMIC LPG block the
+#        ADSP firmware drives, and the fan gets stuck at 100%.
+#
+#  License: MIT
+# =====================================================================
+set -uo pipefail
+
+VERSION="1.1.0"
+DBG=/sys/kernel/debug/radxa_svc_glink
+PROF=/sys/class/platform-profile/platform-profile-0
+NAME=radxa_svc_glink
+
+if [ -t 1 ]; then
+    R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[36m'; N=$'\033[1m'; O=$'\033[0m'
+else
+    R=""; G=""; Y=""; B=""; N=""; O=""
+fi
+
+die()  { printf '%s%s[x]%s %s\n' "$N" "$R" "$O" "$*" >&2; exit 1; }
+warn() { printf '%s[!]%s %s\n' "$Y" "$O" "$*" >&2; }
+ok()   { printf '%s[+]%s %s\n' "$G" "$O" "$*"; }
+hdr()  { printf '\n%s== %s ==%s\n' "$N" "$*" "$O"; }
+
+need_root() {
+    [ "$(id -u)" = "0" ] || die "'$1' needs root (use sudo)"
+}
+
+# ---------------------------------------------------------------- lookup
+find_hwmon() {
+    local h
+    for h in /sys/class/hwmon/hwmon*; do
+        [ -r "$h/name" ] || continue
+        [ "$(cat "$h/name" 2>/dev/null)" = "$NAME" ] && { printf '%s\n' "$h"; return 0; }
+    done
+    return 1
+}
+
+get_hwmon_or_hint() {
+    local h
+    if ! h=$(find_hwmon); then
+        cat >&2 <<EOF
+${N}${R}x${O} fan device ($NAME) not found.
+
+The Q8B fan is driven by the Radxa SVC firmware on the ADSP and Linux
+only sees it while that service is alive. Check:
+
+  1. BIOS: Radxa Platform Configuration -> Hypervisor Settings must be
+     ${N}Auto${O} (or Disabled/Close). With ${N}Enable${O} the hypervisor takes over
+     the ADSP and the service never shows up.
+  2. Is the service up?
+       dmesg | grep -i radxa_svc
+       lsmod | grep radxa_svc_glink
+     A crashed service comes back with a plain reboot.
+  3. Make sure the pmc8280c-pwm node is ${N}disabled${O} in the device tree
+     ("ls /sys/class/pwm/" must be empty), otherwise leds-qcom-lpg fights
+     the firmware over the same PWM and the fan sticks at 100%.
+
+EOF
+        exit 1
+    fi
+    printf '%s\n' "$h"
+}
+
+mode_name() {
+    case "$1" in
+        0) echo "full speed (forced)" ;;
+        1) echo "manual" ;;
+        2) echo "automatic (firmware thermal control)" ;;
+        *) echo "unknown ($1)" ;;
+    esac
+}
+
+pct() { awk -v v="${1:-0}" 'BEGIN{ printf "%.0f", v*100/255 }'; }
+
+# read the whole fan_state file once and answer any field from it
+FAN_STATE=""
+load_fan_state() { FAN_STATE=$(cat "$DBG/fan_state" 2>/dev/null); }
+fs_field() { printf '%s\n' "$FAN_STATE" | awk -F': *' -v k="$1" '$1==k {print $2; exit}'; }
+
+# ------------------------------------------------------------------ commands
+cmd_status() {
+    local h pwm enable prof
+    h=$(get_hwmon_or_hint)
+    pwm=$(cat "$h/pwm1" 2>/dev/null)           # 1 rpmsg request
+    enable=$(cat "$h/pwm1_enable" 2>/dev/null) # 1 rpmsg request
+    prof=$(cat "$PROF/profile" 2>/dev/null)    # 1 rpmsg request
+    load_fan_state                             # 1 rpmsg request
+
+    hdr "fan"
+    printf '  device       : %s\n' "$h"
+    printf '  duty         : %s/255  (~%s%%)\n' "${pwm:-?}" "$(pct "${pwm:-0}")"
+    printf '  mode         : %s -> %s\n' "${enable:-?}" "$(mode_name "${enable:-x}")"
+    printf '  profile      : %s\n' "${prof:--}"
+
+    if [ -n "$FAN_STATE" ]; then
+        local ver; ver=$(cat "$DBG/version" 2>/dev/null)     # 1 rpmsg request
+        printf '  firmware     : v%s.%s  cpu %s C / gpu %s C  loop %s  faults %s\n' \
+            "$(printf '%s\n' "$ver" | awk -F': *' '$1=="major"{print $2}')" \
+            "$(printf '%s\n' "$ver" | awk -F': *' '$1=="minor"{print $2}')" \
+            "$(fs_field cpu_temp_c)" "$(fs_field gpu_temp_c)" \
+            "$(fs_field loop_count)" "$(fs_field fault_count)"
+        printf '  duty now/tgt : %s ns / %s ns   (ch %s, period %s ns)\n' \
+            "$(fs_field current_duty_ns)" "$(fs_field target_duty_ns)" \
+            "$(fs_field pwm_channel)" "$(fs_field pwm_period_ns)"
+        [ "$(fs_field emergency)" = "1" ] && warn "firmware emergency cooling active!"
+    fi
+
+    hdr "kernel thermal sensors"
+    local z t v
+    for z in /sys/class/thermal/thermal_zone*; do
+        [ -r "$z/type" ] || continue
+        t=$(cat "$z/type" 2>/dev/null)
+        case "$t" in
+            cluster0-thermal|cluster1-thermal|gpuss-0-thermal|pm8280-1-thermal|\
+            top-left-thermal|top-right-thermal|led-thermal|vbat-thermal)
+                v=$(cat "$z/temp" 2>/dev/null)
+                printf '  %-18s %d.%d C\n' "$t" "$((v/1000))" "$(((v%1000)/100))"
+                ;;
+        esac
+    done
+}
+
+cmd_auto() {
+    need_root auto
+    local h; h=$(get_hwmon_or_hint)
+    echo 2 > "$h/pwm1_enable" || die "failed to switch to auto mode"
+    ok "mode : $(mode_name "$(cat "$h/pwm1_enable")")"
+    ok "duty : $(cat "$h/pwm1")/255  (the firmware moves it with the temperature)"
+}
+
+cmd_full() {
+    need_root full
+    local h; h=$(get_hwmon_or_hint)
+    echo 0 > "$h/pwm1_enable" || die "failed to force full speed"
+    ok "mode : $(mode_name "$(cat "$h/pwm1_enable")")  duty=$(cat "$h/pwm1")/255"
+    warn "restore with: $0 auto"
+}
+
+cmd_manual() {
+    local pct_in="${1:-}"
+    need_root manual
+    local h; h=$(get_hwmon_or_hint)
+
+    # pwm1 is only writable while the firmware already is in manual mode
+    echo 1 > "$h/pwm1_enable" || die "failed to switch to manual mode"
+
+    if [ -n "$pct_in" ]; then
+        case "$pct_in" in *[!0-9]*|'') die "expected a percentage 0..100";; esac
+        [ "$pct_in" -le 100 ] || die "expected a percentage 0..100"
+        local val=$(( (pct_in * 255 + 50) / 100 ))
+        [ "$pct_in" -gt 0 ] && [ "$val" -eq 0 ] && val=1
+        echo "$val" > "$h/pwm1" || die "failed to write pwm1"
+        [ "$pct_in" -eq 0 ] && warn "0% can stop the fan completely - '$0 auto' gives control back"
+    fi
+
+    ok "mode : $(mode_name "$(cat "$h/pwm1_enable")")  duty=$(cat "$h/pwm1")/255 (~$(pct "$(cat "$h/pwm1")")%)"
+    [ -z "$pct_in" ] && ok "froze the current speed"
+    warn "manual mode stays until reboot or '$0 auto'"
+}
+
+cmd_profile() {
+    local want="${1:-}"
+    [ -d "$PROF" ] || die "no platform-profile device (firmware too old?)"
+    if [ -z "$want" ]; then
+        printf 'profile : %s\nchoices : %s\n' \
+            "$(cat "$PROF/profile" 2>/dev/null)" "$(tr '\n' ' ' < "$PROF/choices" 2>/dev/null)"
+        return
+    fi
+    need_root profile
+    case " $(tr '\n' ' ' < "$PROF/choices" 2>/dev/null) " in
+        *" $want "*) ;;
+        *) die "unknown profile '$want' (choices: $(tr '\n' ' ' < "$PROF/choices" 2>/dev/null))";;
+    esac
+    echo "$want" > "$PROF/profile" || die "failed to set profile"
+    ok "profile: $(cat "$PROF/profile")   (the fan curve itself lives in the firmware)"
+}
+
+cmd_info() {
+    [ -d "$DBG" ] || die "$DBG not present (service down?)"
+    hdr "firmware"; cat "$DBG/version" 2>/dev/null | sed 's/^/  /'
+    hdr "pwm";      cat "$DBG/pwm_info" 2>/dev/null | sed 's/^/  /'
+                    cat "$DBG/pwm_state" 2>/dev/null | sed 's/^/  /'
+    hdr "link";     cat "$DBG/stats" 2>/dev/null | sed 's/^/  /'
+}
+
+cmd_temps() {
+    # the firmware exposes 46 sensors; TSENS_GET_ALL is not implemented
+    # (it just times out for 5s), so ask for one sensor at a time.
+    local idx="${1:-}"
+    [ -r "$DBG/tsens_temp" ] || die "no firmware tsens interface (service down?)"
+    local n; n=$(cat "$DBG/tsens_count" 2>/dev/null | awk -F': *' '$1=="num_sensors"{print $2}')
+    if [ -z "$idx" ]; then
+        printf 'firmware tsens sensors: %s\n' "${n:-?}"
+        printf 'usage: %s temps <0..%s>     # one sensor per call\n' "$0" "$(( ${n:-0} - 1 ))"
+        cat "$DBG/tsens_max" 2>/dev/null | sed 's/^/  hottest: /'
+        return
+    fi
+    case "$idx" in *[!0-9]*) die "expected a sensor index";; esac
+    [ -n "$n" ] && [ "$idx" -ge "$n" ] && die "sensor index out of range (0..$((n-1)))"
+    echo "$idx" > "$DBG/tsens_temp" || die "failed to select sensor $idx"
+    local out; out=$(cat "$DBG/tsens_temp" 2>/dev/null)
+    printf 'sensor %-3s %s C   (controller %s, channel %s)\n' "$idx" \
+        "$(printf '%s\n' "$out" | awk -F': *' '$1=="temp_c"{print $2}')" \
+        "$(printf '%s\n' "$out" | awk -F': *' '$1=="controller"{print $2}')" \
+        "$(printf '%s\n' "$out" | awk -F': *' '$1=="channel"{print $2}')"
+}
+
+cmd_log() {
+    [ -r "$DBG/log" ] || die "no firmware log"
+    cat "$DBG/log"
+}
+
+cmd_watch() {
+    local secs="${1:-2}" h
+    case "$secs" in *[!0-9.]*|'') die "usage: $0 watch [seconds]";; esac
+    h=$(get_hwmon_or_hint)
+
+    # temperatures come from the kernel thermal zones on purpose: that
+    # costs no extra round trips to the ADSP.
+    local zc
+    for z in /sys/class/thermal/thermal_zone*; do
+        [ "$(cat "$z/type" 2>/dev/null)" = "cluster0-thermal" ] && zc=$z
+    done
+
+    printf '%s  %-8s %-6s %-4s %-10s %s%s\n' "$N" time duty pct mode "cluster0" "$O"
+    trap 'echo; exit 0' INT TERM
+    while :; do
+        local pwm en t=""
+        pwm=$(cat "$h/pwm1" 2>/dev/null)          # 1 request
+        en=$(cat "$h/pwm1_enable" 2>/dev/null)    # 1 request
+        if [ -n "${zc:-}" ]; then
+            local v; v=$(cat "$zc/temp" 2>/dev/null)
+            t="$((v/1000)).$(((v%1000)/100)) C"
+        fi
+        printf '  %-8s %-6s %-4s %-10s %s\n' \
+            "$(date +%T)" "${pwm:-?}" "$(pct "${pwm:-0}")%" "${en:-?}" "$t"
+        sleep "$secs"
+    done
+}
+
+usage() {
+    cat <<EOF
+${N}q8b-fan $VERSION${O} - fan control for the Radxa Dragon Q8B
+
+Usage: sudo q8b-fan [command] [args]
+
+  status                    fan duty/mode/profile + temperatures   (default)
+  auto                      hand control back to the firmware          [root]
+  full                      force full speed                           [root]
+  manual [0-100]            manual speed, no value = freeze current    [root]
+  profile [quiet|performance]   get/set the platform profile           [root]
+  watch [seconds]           live duty / mode / cluster0 temperature
+  info                      firmware version, PWM info, link stats
+  temps [sensor]            firmware tsens sensors (one at a time)
+  log                       firmware log
+  help | --version
+
+Notes
+  * The fan is driven by Radxa's SVC firmware on the ADSP, not by Linux;
+    the real fan curve therefore lives in the firmware. 'quiet' and
+    'performance' select between two curves.
+  * BIOS -> Radxa Platform Configuration -> Hypervisor Settings must be
+    Auto (or Disabled) - with "Enable" the service does not come up.
+  * Never enable the pmc8280c-pwm node in the device tree: leds-qcom-lpg
+    would take the same PWM the firmware drives -> fan stuck at 100%.
+  * Every value above is fetched over rpmsg from the ADSP, so don't poll
+    this tool in a tight loop.
+EOF
+}
+
+case "${1:-status}" in
+    status|st)      cmd_status ;;
+    auto)           cmd_auto ;;
+    full)           cmd_full ;;
+    manual|man)     shift; cmd_manual "${1:-}" ;;
+    profile|prof)   shift; cmd_profile "${1:-}" ;;
+    watch|w)        shift; cmd_watch "${1:-2}" ;;
+    info)           cmd_info ;;
+    temps|temp)     shift; cmd_temps "${1:-}" ;;
+    log)            cmd_log ;;
+    -h|--help|help) usage ;;
+    -V|--version)   echo "$VERSION" ;;
+    *)              usage; die "unknown command: ${1}" ;;
+esac
